@@ -1,0 +1,17 @@
+[package]
+name = "tokio-quiche"
+version = "0.1.0"
+authors = ["quininer <quininer@live.com>"]
+edition = "2018"
+
+[dependencies]
+log = "*"
+rand = "*"
+bytes = "*"
+futures = "*"
+tokio-io = "*"
+tokio-timer = "*"
+tokio-executor = "*"
+tokio-sync = "*"
+tokio-udp = "*"
+quiche = { path = "../fork/quiche", default-features = false }
