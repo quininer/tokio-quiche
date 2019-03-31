@@ -3,8 +3,10 @@ mod common;
 use std::{ io, mem };
 use std::time::Instant;
 use std::sync::{ Arc, Mutex };
-use futures::{ try_ready, Future, Poll, Async };
+use std::collections::HashMap;
+use futures::{ try_ready, Future, Stream, Poll, Async };
 use tokio_timer::Delay;
+use tokio_sync::{ mpsc, oneshot };
 use common::{ LossyIo, to_io_error };
 
 
@@ -21,17 +23,54 @@ enum MidHandshake<IO> {
     End
 }
 
-pub struct Connection {}
-
-pub struct Incoming {}
-
-pub struct Driver<IO> {
-    inner: Inner<IO>
+pub struct Connection {
+    anchor: Arc<Anchor>,
+    trace_id: String,
+    alpn: Vec<u8>,
+    is_resumed: bool
 }
 
-pub struct Stream {}
+pub struct Incoming {
+    anchor: Arc<Anchor>,
+    rx: mpsc::UnboundedReceiver<QuicStream>
+}
 
-pub struct Inner<IO> {
+struct Anchor(Option<oneshot::Sender<()>>);
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+pub struct Driver<IO> {
+    inner: Inner<IO>,
+    close_recv: oneshot::Receiver<()>,
+    incoming_send: mpsc::UnboundedSender<QuicStream>,
+    stream_map: HashMap<u64, (mpsc::UnboundedSender<Message>, mpsc::UnboundedReceiver<Message>)>
+}
+
+pub struct QuicStream {
+    id: u64,
+    tx: mpsc::UnboundedSender<Message>,
+    rx: mpsc::UnboundedReceiver<Message>
+}
+
+impl Drop for QuicStream {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(Message::Close);
+    }
+}
+
+enum Message {
+    Bytes(Vec<u8>),
+    End(Vec<u8>),
+    Close
+}
+
+struct Inner<IO> {
     io: IO,
     connect: Box<quiche::Connection>,
     timer: Option<Delay>,
@@ -144,11 +183,61 @@ impl<IO: LossyIo> Future for Connecting<IO> {
 
         match mem::replace(&mut self.inner, MidHandshake::End) {
             MidHandshake::Handshaking(inner) => {
+                let (anchor, close_recv) = oneshot::channel();
+                let anchor = Arc::new(Anchor(Some(anchor)));
+                let (incoming_send, incoming_recv) = mpsc::unbounded_channel();
+
+                let connection = Connection {
+                    anchor: Arc::clone(&anchor),
+                    trace_id: inner.connect.trace_id().to_string(),
+                    alpn: inner.connect.application_proto().to_vec(),
+                    is_resumed: inner.connect.is_resumed()
+                };
+
+                let incoming = Incoming { anchor, rx: incoming_recv };
+
+                let driver = Driver {
+                    inner, close_recv, incoming_send,
+                    stream_map: HashMap::new()
+                };
+
                 // TODO
 
-                Ok(Async::Ready((Driver { inner }, Connection {}, Incoming {})))
+                Ok(Async::Ready((driver, connection, incoming)))
             },
             MidHandshake::End => panic!()
         }
+    }
+}
+
+impl<IO: LossyIo> Future for Driver<IO> {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            self.inner.poll_complete().map_err(drop)?;
+
+            for stream_id in self.inner.connect.readable() {
+                if !self.stream_map.get(&stream_id).is_some() {
+                    // TODO
+                }
+            }
+
+            // TODO
+
+            if let Async::Ready(()) = self.close_recv.poll().map_err(drop)? {
+                return Ok(Async::Ready(()));
+            }
+        }
+    }
+}
+
+impl Stream for Incoming {
+    type Item = QuicStream;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.rx.poll().map_err(drop)
     }
 }
