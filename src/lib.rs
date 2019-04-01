@@ -3,7 +3,9 @@ mod common;
 use std::{ io, mem };
 use std::time::Instant;
 use std::sync::{ Arc, Mutex };
-use std::collections::HashMap;
+use std::collections::{ HashMap, VecDeque };
+use bytes::{ Bytes, BytesMut, BufMut };
+use smallvec::SmallVec;
 use futures::{ try_ready, Future, Stream, Poll, Async };
 use tokio_timer::Delay;
 use tokio_sync::{ mpsc, oneshot };
@@ -49,13 +51,17 @@ pub struct Driver<IO> {
     inner: Inner<IO>,
     close_recv: oneshot::Receiver<()>,
     incoming_send: mpsc::UnboundedSender<QuicStream>,
-    stream_map: HashMap<u64, (mpsc::UnboundedSender<Message>, mpsc::UnboundedReceiver<Message>)>
+    event_send: mpsc::UnboundedSender<u64>,
+    event_recv: mpsc::UnboundedReceiver<u64>,
+    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, mpsc::UnboundedReceiver<Message>)>,
+    send_buf: BytesMut
 }
 
 pub struct QuicStream {
     id: u64,
+    event_send: mpsc::UnboundedSender<u64>,
     tx: mpsc::UnboundedSender<Message>,
-    rx: mpsc::UnboundedReceiver<Message>
+    rx: mpsc::UnboundedReceiver<quiche::Result<Message>>,
 }
 
 impl Drop for QuicStream {
@@ -65,9 +71,9 @@ impl Drop for QuicStream {
 }
 
 enum Message {
-    Bytes(Vec<u8>),
-    End(Vec<u8>),
-    Close
+    Bytes(Bytes),
+    End(Bytes),
+    Close,
 }
 
 struct Inner<IO> {
@@ -186,6 +192,7 @@ impl<IO: LossyIo> Future for Connecting<IO> {
                 let (anchor, close_recv) = oneshot::channel();
                 let anchor = Arc::new(Anchor(Some(anchor)));
                 let (incoming_send, incoming_recv) = mpsc::unbounded_channel();
+                let (event_send, event_recv) = mpsc::unbounded_channel();
 
                 let connection = Connection {
                     anchor: Arc::clone(&anchor),
@@ -198,7 +205,9 @@ impl<IO: LossyIo> Future for Connecting<IO> {
 
                 let driver = Driver {
                     inner, close_recv, incoming_send,
-                    stream_map: HashMap::new()
+                    event_send, event_recv,
+                    stream_map: HashMap::new(),
+                    send_buf: BytesMut::new(),
                 };
 
                 // TODO
@@ -212,22 +221,77 @@ impl<IO: LossyIo> Future for Connecting<IO> {
 
 impl<IO: LossyIo> Future for Driver<IO> {
     type Item = ();
-    type Error = ();
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
-            self.inner.poll_complete().map_err(drop)?;
+            self.inner.poll_complete()?;
 
-            for stream_id in self.inner.connect.readable() {
-                if !self.stream_map.get(&stream_id).is_some() {
-                    // TODO
+            while let Ok(Async::Ready(Some(stream_id))) = self.event_recv.poll() {
+                if let Some((tx, rx)) = self.stream_map.get_mut(&stream_id) {
+                    while let Ok(Async::Ready(Some(msg))) = rx.poll() {
+                        let result = match msg {
+                            Message::Bytes(bytes) => self.inner.connect.stream_send(stream_id, &bytes, false),
+                            Message::End(bytes) => self.inner.connect.stream_send(stream_id, &bytes, true),
+                            Message::Close => self.inner.connect.stream_send(stream_id, &[], true)
+                        };
+
+                        // TODO better error
+                        // TODO always write to end ?
+                        if let Err(err) = result {
+                            let _ = tx.try_send(Err(err));
+                        }
+                    }
                 }
             }
 
-            // TODO
+            let readable = self.inner.connect
+                .readable()
+                .collect::<SmallVec<[_; 4]>>();
+            for stream_id in readable {
+                let mut incoming_send = self.incoming_send.clone();
+                let event_send = self.event_send.clone();
 
-            if let Async::Ready(()) = self.close_recv.poll().map_err(drop)? {
-                return Ok(Async::Ready(()));
+                let (tx, _) = self.stream_map.entry(stream_id)
+                    .or_insert_with(move || {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        let (tx2, rx2) = mpsc::unbounded_channel();
+
+                        let _ = incoming_send.try_send(QuicStream {
+                            id: stream_id, tx: tx2,
+                            event_send, rx
+                        });
+
+                        (tx, rx2)
+                    });
+
+                self.send_buf.reserve(8 * 1024); // TODO
+
+                match self.inner.connect.stream_recv(stream_id, unsafe { self.send_buf.bytes_mut() }) {
+                    Ok((n, fin)) => {
+                        unsafe { self.send_buf.advance_mut(n) };
+
+                        let _ = tx.try_send(Ok(if fin {
+                            Message::End(self.send_buf.take().freeze())
+                        } else {
+                            Message::Bytes(self.send_buf.take().freeze())
+                        }));
+                    },
+                    Err(err) => {
+                        let _ = tx.try_send(Err(err));
+                    }
+                }
+            }
+
+            match self.close_recv.poll() {
+                Ok(Async::Ready(())) | Err(_) => {
+                    // TODO handle close
+                },
+                _ => ()
+            }
+
+            if self.inner.connect.is_closed() {
+                return Ok(Async::Ready(()))
             }
         }
     }
