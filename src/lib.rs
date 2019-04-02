@@ -6,6 +6,7 @@ use std::sync::{ Arc, Mutex };
 use std::collections::{ HashMap, VecDeque };
 use bytes::{ Bytes, BytesMut, BufMut };
 use smallvec::SmallVec;
+use crossbeam_queue::SegQueue;
 use futures::{ try_ready, Future, Stream, Poll, Async };
 use tokio_timer::Delay;
 use tokio_sync::{ mpsc, oneshot };
@@ -53,20 +54,20 @@ pub struct Driver<IO> {
     incoming_send: mpsc::UnboundedSender<QuicStream>,
     event_send: mpsc::UnboundedSender<u64>,
     event_recv: mpsc::UnboundedReceiver<u64>,
-    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, mpsc::UnboundedReceiver<Message>)>,
+    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, Arc<SegQueue<Message>>)>,
     send_buf: BytesMut
 }
 
 pub struct QuicStream {
     id: u64,
     event_send: mpsc::UnboundedSender<u64>,
-    tx: mpsc::UnboundedSender<Message>,
-    rx: mpsc::UnboundedReceiver<quiche::Result<Message>>,
+    queue: Arc<SegQueue<Message>>,
+    rx: mpsc::UnboundedReceiver<quiche::Result<Message>>
 }
 
 impl Drop for QuicStream {
     fn drop(&mut self) {
-        let _ = self.tx.try_send(Message::Close);
+        let _ = self.queue.push(Message::Close);
     }
 }
 
@@ -229,14 +230,13 @@ impl<IO: LossyIo> Future for Driver<IO> {
 
             while let Ok(Async::Ready(Some(stream_id))) = self.event_recv.poll() {
                 if let Some((tx, rx)) = self.stream_map.get_mut(&stream_id) {
-                    while let Ok(Async::Ready(Some(msg))) = rx.poll() {
+                    while let Ok(msg) = rx.pop() {
                         let result = match msg {
                             Message::Bytes(bytes) => self.inner.connect.stream_send(stream_id, &bytes, false),
                             Message::End(bytes) => self.inner.connect.stream_send(stream_id, &bytes, true),
                             Message::Close => self.inner.connect.stream_send(stream_id, &[], true)
                         };
 
-                        // TODO better error
                         // TODO always write to end ?
                         if let Err(err) = result {
                             let _ = tx.try_send(Err(err));
@@ -255,14 +255,15 @@ impl<IO: LossyIo> Future for Driver<IO> {
                 let (tx, _) = self.stream_map.entry(stream_id)
                     .or_insert_with(move || {
                         let (tx, rx) = mpsc::unbounded_channel();
-                        let (tx2, rx2) = mpsc::unbounded_channel();
+                        let queue = Arc::new(SegQueue::new());
+                        let queue2 = queue.clone();
 
                         let _ = incoming_send.try_send(QuicStream {
-                            id: stream_id, tx: tx2,
-                            event_send, rx
+                            id: stream_id,
+                            event_send, queue, rx
                         });
 
-                        (tx, rx2)
+                        (tx, queue2)
                     });
 
                 self.send_buf.reserve(8 * 1024); // TODO
