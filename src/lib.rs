@@ -1,13 +1,13 @@
 mod common;
 
-use std::{ io, mem };
+use std::{ io, mem, cmp };
 use std::time::Instant;
 use std::sync::{ Arc, Mutex };
-use std::collections::{ HashMap, VecDeque };
+use std::collections::{ HashMap, VecDeque, hash_map::Entry };
 use bytes::{ Bytes, BytesMut, BufMut };
 use smallvec::SmallVec;
-use crossbeam_queue::SegQueue;
-use futures::{ try_ready, Future, Stream, Poll, Async };
+use crossbeam_queue::{ ArrayQueue, PushError };
+use futures::{ try_ready, Future, Stream, Sink, Poll, Async, StartSend, AsyncSink };
 use tokio_timer::Delay;
 use tokio_sync::{ mpsc, oneshot };
 use common::{ LossyIo, to_io_error };
@@ -35,7 +35,7 @@ pub struct Connection {
 
 pub struct Incoming {
     anchor: Arc<Anchor>,
-    rx: mpsc::UnboundedReceiver<QuicStream>
+    rx: mpsc::UnboundedReceiver<InnerStream>
 }
 
 struct Anchor(Option<oneshot::Sender<()>>);
@@ -50,22 +50,30 @@ impl Drop for Anchor {
 
 pub struct Driver<IO> {
     inner: Inner<IO>,
+    max_id: u64,
     close_recv: oneshot::Receiver<()>,
-    incoming_send: mpsc::UnboundedSender<QuicStream>,
+    close_queue: Vec<u64>,
+    incoming_send: mpsc::UnboundedSender<InnerStream>,
     event_send: mpsc::UnboundedSender<u64>,
     event_recv: mpsc::UnboundedReceiver<u64>,
-    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, Arc<SegQueue<Message>>)>,
+    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, Arc<ArrayQueue<Message>>)>,
     send_buf: BytesMut
 }
 
 pub struct QuicStream {
+    anchor: Arc<Anchor>,
+    inner: InnerStream,
+    buf: Bytes
+}
+
+struct InnerStream {
     id: u64,
     event_send: mpsc::UnboundedSender<u64>,
-    queue: Arc<SegQueue<Message>>,
+    queue: Arc<ArrayQueue<Message>>,
     rx: mpsc::UnboundedReceiver<quiche::Result<Message>>
 }
 
-impl Drop for QuicStream {
+impl Drop for InnerStream {
     fn drop(&mut self) {
         let _ = self.queue.push(Message::Close);
     }
@@ -108,13 +116,7 @@ impl<IO: LossyIo> Inner<IO> {
         self.poll_recv()?;
         self.poll_send()?;
 
-        if self.connect.is_closed() {
-            // handle close
-
-            Ok(Async::Ready(()))
-        } else {
-            Ok(Async::NotReady)
-        }
+        Ok(Async::NotReady)
     }
 
     fn poll_send(&mut self) -> Poll<(), io::Error> {
@@ -159,9 +161,8 @@ impl<IO: LossyIo> Inner<IO> {
             match self.connect.recv(&mut self.recv_buf[..n]) {
                 Ok(_) => (),
                 Err(quiche::Error::Done) => return Ok(Async::Ready(())),
+                Err(quiche::Error::BufferTooShort) => return Ok(Async::NotReady),
                 Err(err) => {
-                    // ignore some error
-
                     self.connect.close(false, err.to_wire(), b"fail")
                         .map_err(to_io_error)?;
                     return Ok(Async::NotReady);
@@ -207,6 +208,8 @@ impl<IO: LossyIo> Future for Connecting<IO> {
                 let driver = Driver {
                     inner, close_recv, incoming_send,
                     event_send, event_recv,
+                    max_id: 0,
+                    close_queue: Vec::new(),
                     stream_map: HashMap::new(),
                     send_buf: BytesMut::new(),
                 };
@@ -228,13 +231,16 @@ impl<IO: LossyIo> Future for Driver<IO> {
         loop {
             self.inner.poll_complete()?;
 
-            while let Ok(Async::Ready(Some(stream_id))) = self.event_recv.poll() {
-                if let Some((tx, rx)) = self.stream_map.get_mut(&stream_id) {
+            while let Ok(Async::Ready(Some(id))) = self.event_recv.poll() {
+                if let Some((tx, rx)) = self.stream_map.get_mut(&id) {
                     while let Ok(msg) = rx.pop() {
                         let result = match msg {
-                            Message::Bytes(bytes) => self.inner.connect.stream_send(stream_id, &bytes, false),
-                            Message::End(bytes) => self.inner.connect.stream_send(stream_id, &bytes, true),
-                            Message::Close => self.inner.connect.stream_send(stream_id, &[], true)
+                            Message::Bytes(bytes) => self.inner.connect.stream_send(id, &bytes, false),
+                            Message::End(bytes) => self.inner.connect.stream_send(id, &bytes, true),
+                            Message::Close => {
+                                self.close_queue.push(id);
+                                self.inner.connect.stream_send(id, &[], true)
+                            }
                         };
 
                         // TODO always write to end ?
@@ -248,27 +254,34 @@ impl<IO: LossyIo> Future for Driver<IO> {
             let readable = self.inner.connect
                 .readable()
                 .collect::<SmallVec<[_; 4]>>();
-            for stream_id in readable {
+            for id in readable {
                 let mut incoming_send = self.incoming_send.clone();
                 let event_send = self.event_send.clone();
 
-                let (tx, _) = self.stream_map.entry(stream_id)
+                let entry = self.stream_map.entry(id);
+
+                if let Entry::Vacant(_) = entry {
+                    if id > self.max_id {
+                        self.max_id = id;
+                    } else {
+                        continue
+                    }
+                }
+
+                let (tx, _) = entry
                     .or_insert_with(move || {
                         let (tx, rx) = mpsc::unbounded_channel();
-                        let queue = Arc::new(SegQueue::new());
+                        let queue = Arc::new(ArrayQueue::new(8)); // TODO
                         let queue2 = queue.clone();
 
-                        let _ = incoming_send.try_send(QuicStream {
-                            id: stream_id,
-                            event_send, queue, rx
-                        });
+                        let _ = incoming_send.try_send(InnerStream { id, event_send, queue, rx });
 
                         (tx, queue2)
                     });
 
                 self.send_buf.reserve(8 * 1024); // TODO
 
-                match self.inner.connect.stream_recv(stream_id, unsafe { self.send_buf.bytes_mut() }) {
+                match self.inner.connect.stream_recv(id, unsafe { self.send_buf.bytes_mut() }) {
                     Ok((n, fin)) => {
                         unsafe { self.send_buf.advance_mut(n) };
 
@@ -284,15 +297,16 @@ impl<IO: LossyIo> Future for Driver<IO> {
                 }
             }
 
-            match self.close_recv.poll() {
-                Ok(Async::Ready(())) | Err(_) => {
-                    // TODO handle close
-                },
-                _ => ()
+            if let Ok(Async::Ready(())) = self.close_recv.poll() {
+                self.inner.connect.close(true, 0x0, b"closing").map_err(to_io_error)?;
             }
 
             if self.inner.connect.is_closed() {
                 return Ok(Async::Ready(()))
+            }
+
+            while let Some(id) = self.close_queue.pop() {
+                self.stream_map.remove(&id);
             }
         }
     }
@@ -303,6 +317,20 @@ impl Stream for Incoming {
     type Error = ();
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.rx.poll().map_err(drop)
+        match self.rx.poll() {
+            Ok(Async::Ready(Some(inner))) => Ok(Async::Ready(Some(QuicStream {
+                inner,
+                anchor: self.anchor.clone(),
+                buf: Bytes::new()
+            }))),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            _ => Ok(Async::Ready(None))
+        }
+    }
+}
+
+impl io::Read for QuicStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unimplemented!()
     }
 }
