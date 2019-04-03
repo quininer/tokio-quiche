@@ -54,9 +54,9 @@ pub struct Driver<IO> {
     close_recv: oneshot::Receiver<()>,
     close_queue: Vec<u64>,
     incoming_send: mpsc::UnboundedSender<InnerStream>,
-    event_send: mpsc::UnboundedSender<u64>,
-    event_recv: mpsc::UnboundedReceiver<u64>,
-    stream_map: HashMap<u64, (mpsc::UnboundedSender<quiche::Result<Message>>, Arc<ArrayQueue<Message>>)>,
+    event_send: mpsc::Sender<(u64, Message)>,
+    event_recv: mpsc::Receiver<(u64, Message)>,
+    stream_map: HashMap<u64, mpsc::UnboundedSender<quiche::Result<Message>>>,
     send_buf: BytesMut
 }
 
@@ -68,15 +68,8 @@ pub struct QuicStream {
 
 struct InnerStream {
     id: u64,
-    event_send: mpsc::UnboundedSender<u64>,
-    queue: Arc<ArrayQueue<Message>>,
+    event_send: mpsc::Sender<(u64, Message)>,
     rx: mpsc::UnboundedReceiver<quiche::Result<Message>>
-}
-
-impl Drop for InnerStream {
-    fn drop(&mut self) {
-        let _ = self.queue.push(Message::Close);
-    }
 }
 
 enum Message {
@@ -194,7 +187,7 @@ impl<IO: LossyIo> Future for Connecting<IO> {
                 let (anchor, close_recv) = oneshot::channel();
                 let anchor = Arc::new(Anchor(Some(anchor)));
                 let (incoming_send, incoming_recv) = mpsc::unbounded_channel();
-                let (event_send, event_recv) = mpsc::unbounded_channel();
+                let (event_send, event_recv) = mpsc::channel(32); // TODO
 
                 let connection = Connection {
                     anchor: Arc::clone(&anchor),
@@ -231,22 +224,20 @@ impl<IO: LossyIo> Future for Driver<IO> {
         loop {
             self.inner.poll_complete()?;
 
-            while let Ok(Async::Ready(Some(id))) = self.event_recv.poll() {
-                if let Some((tx, rx)) = self.stream_map.get_mut(&id) {
-                    while let Ok(msg) = rx.pop() {
-                        let result = match msg {
-                            Message::Bytes(bytes) => self.inner.connect.stream_send(id, &bytes, false),
-                            Message::End(bytes) => self.inner.connect.stream_send(id, &bytes, true),
-                            Message::Close => {
-                                self.close_queue.push(id);
-                                self.inner.connect.stream_send(id, &[], true)
-                            }
-                        };
+            while let Ok(Async::Ready(Some((id, msg)))) = self.event_recv.poll() {
+                let result = match msg {
+                    Message::Bytes(bytes) => self.inner.connect.stream_send(id, &bytes, false),
+                    Message::End(bytes) => self.inner.connect.stream_send(id, &bytes, true),
+                    Message::Close => {
+                        self.close_queue.push(id);
+                        self.inner.connect.stream_send(id, &[], true)
+                    }
+                };
 
-                        // TODO always write to end ?
-                        if let Err(err) = result {
-                            let _ = tx.try_send(Err(err));
-                        }
+                // TODO always write to end ?
+                if let Err(err) = result {
+                    if let Some(tx) = self.stream_map.get_mut(&id) {
+                        let _ = tx.try_send(Err(err));
                     }
                 }
             }
@@ -268,15 +259,11 @@ impl<IO: LossyIo> Future for Driver<IO> {
                     }
                 }
 
-                let (tx, _) = entry
+                let tx = entry
                     .or_insert_with(move || {
                         let (tx, rx) = mpsc::unbounded_channel();
-                        let queue = Arc::new(ArrayQueue::new(8)); // TODO
-                        let queue2 = queue.clone();
-
-                        let _ = incoming_send.try_send(InnerStream { id, event_send, queue, rx });
-
-                        (tx, queue2)
+                        let _ = incoming_send.try_send(InnerStream { id, event_send, rx });
+                        tx
                     });
 
                 self.send_buf.reserve(8 * 1024); // TODO
@@ -329,8 +316,47 @@ impl Stream for Incoming {
     }
 }
 
-impl io::Read for QuicStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        unimplemented!()
+impl Sink for QuicStream {
+    type SinkItem = Bytes;
+    type SinkError = io::Error;
+
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        match self.inner.event_send.start_send((self.inner.id, Message::Bytes(item))) {
+            Ok(AsyncSink::Ready) => Ok(AsyncSink::Ready),
+            Ok(AsyncSink::NotReady((_, Message::Bytes(item)))) => Ok(AsyncSink::NotReady(item)),
+            Ok(_) => unreachable!(),
+            Err(err) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, err))
+        }
+    }
+
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        Ok(Async::Ready(()))
+    }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        match self.inner.event_send.start_send((self.inner.id, Message::Close)) {
+            Ok(AsyncSink::Ready) => Ok(Async::Ready(())),
+            Ok(AsyncSink::NotReady(_)) => Ok(Async::NotReady),
+            Err(err) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, err))
+        }
+    }
+}
+
+impl Stream for QuicStream {
+    type Item = Bytes;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.inner.rx.poll() {
+            Ok(Async::Ready(Some(Ok(Message::Bytes(item)))))
+            | Ok(Async::Ready(Some(Ok(Message::End(item)))))
+            => Ok(Async::Ready(Some(item))),
+            Ok(Async::Ready(Some(Err(err)))) => Err(to_io_error(err)),
+            Ok(Async::Ready(Some(Ok(Message::Close))))
+            | Ok(Async::Ready(None))
+            => Ok(Async::Ready(None)),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(err) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, err))
+        }
     }
 }
