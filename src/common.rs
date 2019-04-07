@@ -2,6 +2,7 @@ use std::io;
 use futures::Poll;
 use tokio_udp::UdpSocket;
 
+
 pub trait LossyIo {
     fn poll_read(&mut self, buf: &mut [u8]) -> Poll<usize, io::Error>;
     fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, io::Error>;

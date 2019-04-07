@@ -18,6 +18,7 @@ pub struct QuicConnector {
 }
 
 pub struct Connecting<IO> {
+    is_server: bool,
     inner: MidHandshake<IO>
 }
 
@@ -28,6 +29,7 @@ enum MidHandshake<IO> {
 
 pub struct Connection {
     anchor: Arc<Anchor>,
+    open_send: mpsc::UnboundedSender<oneshot::Sender<InnerStream>>,
     trace_id: String,
     alpn: Vec<u8>,
     is_resumed: bool
@@ -49,6 +51,7 @@ impl Drop for Anchor {
 }
 
 pub struct Driver<IO> {
+    is_server: bool,
     inner: Inner<IO>,
     max_id: u64,
     close_recv: oneshot::Receiver<()>,
@@ -56,14 +59,19 @@ pub struct Driver<IO> {
     incoming_send: mpsc::UnboundedSender<InnerStream>,
     event_send: mpsc::Sender<(u64, Message)>,
     event_recv: mpsc::Receiver<(u64, Message)>,
+    open_recv: mpsc::UnboundedReceiver<oneshot::Sender<InnerStream>>,
     stream_map: HashMap<u64, mpsc::UnboundedSender<quiche::Result<Message>>>,
     send_buf: BytesMut
+}
+
+pub struct Opening {
+    anchor: Option<Arc<Anchor>>,
+    rx: oneshot::Receiver<InnerStream>
 }
 
 pub struct QuicStream {
     anchor: Arc<Anchor>,
     inner: InnerStream,
-    buf: Bytes
 }
 
 struct InnerStream {
@@ -188,19 +196,22 @@ impl<IO: LossyIo> Future for Connecting<IO> {
                 let anchor = Arc::new(Anchor(Some(anchor)));
                 let (incoming_send, incoming_recv) = mpsc::unbounded_channel();
                 let (event_send, event_recv) = mpsc::channel(32); // TODO
+                let (open_send, open_recv) = mpsc::unbounded_channel();
 
                 let connection = Connection {
                     anchor: Arc::clone(&anchor),
                     trace_id: inner.connect.trace_id().to_string(),
                     alpn: inner.connect.application_proto().to_vec(),
-                    is_resumed: inner.connect.is_resumed()
+                    is_resumed: inner.connect.is_resumed(),
+                    open_send
                 };
 
                 let incoming = Incoming { anchor, rx: incoming_recv };
 
                 let driver = Driver {
+                    is_server: self.is_server,
                     inner, close_recv, incoming_send,
-                    event_send, event_recv,
+                    event_send, event_recv, open_recv,
                     max_id: 0,
                     close_queue: Vec::new(),
                     stream_map: HashMap::new(),
@@ -246,20 +257,14 @@ impl<IO: LossyIo> Future for Driver<IO> {
                 .readable()
                 .collect::<SmallVec<[_; 4]>>();
             for id in readable {
+                if self.inner.connect.stream_finished(id) {
+                    continue
+                }
+
                 let mut incoming_send = self.incoming_send.clone();
                 let event_send = self.event_send.clone();
 
-                let entry = self.stream_map.entry(id);
-
-                if let Entry::Vacant(_) = entry {
-                    if id > self.max_id {
-                        self.max_id = id;
-                    } else {
-                        continue
-                    }
-                }
-
-                let tx = entry
+                let tx = self.stream_map.entry(id)
                     .or_insert_with(move || {
                         let (tx, rx) = mpsc::unbounded_channel();
                         let _ = incoming_send.try_send(InnerStream { id, event_send, rx });
@@ -281,6 +286,17 @@ impl<IO: LossyIo> Future for Driver<IO> {
                     Err(err) => {
                         let _ = tx.try_send(Err(err));
                     }
+                }
+            }
+
+            while let Ok(Async::Ready(Some(sender))) = self.open_recv.poll() {
+                // always bidi stream
+                let id = (self.max_id << 2) + if self.is_server { 1 } else { 0 };
+                let event_send = self.event_send.clone();
+                let (tx, rx) = mpsc::unbounded_channel();
+                if sender.send(InnerStream { id, event_send, rx }).is_ok() {
+                    self.stream_map.insert(id, tx);
+                    self.max_id += 1;
                 }
             }
 
@@ -307,11 +323,43 @@ impl Stream for Incoming {
         match self.rx.poll() {
             Ok(Async::Ready(Some(inner))) => Ok(Async::Ready(Some(QuicStream {
                 inner,
-                anchor: self.anchor.clone(),
-                buf: Bytes::new()
+                anchor: self.anchor.clone()
             }))),
             Ok(Async::NotReady) => Ok(Async::NotReady),
             _ => Ok(Async::Ready(None))
+        }
+    }
+}
+
+impl Connection {
+    pub fn open(&mut self) -> Opening {
+        let (tx, rx) = oneshot::channel();
+
+        if self.open_send.try_send(tx).is_ok() {
+            Opening { anchor: Some(self.anchor.clone()), rx }
+        } else {
+            Opening { anchor: None, rx }
+        }
+    }
+}
+
+impl Future for Opening {
+    type Item = QuicStream;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let anchor = match self.anchor.take() {
+            Some(anchor) => anchor,
+            None => return Err(())
+        };
+
+        match self.rx.poll() {
+            Ok(Async::Ready(inner)) => Ok(Async::Ready(QuicStream { anchor, inner })),
+            Ok(Async::NotReady) => {
+                self.anchor = Some(anchor);
+                Ok(Async::NotReady)
+            },
+            Err(_) => Err(())
         }
     }
 }
