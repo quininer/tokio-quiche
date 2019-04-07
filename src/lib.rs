@@ -4,26 +4,28 @@ use std::{ io, mem, cmp };
 use std::time::Instant;
 use std::sync::{ Arc, Mutex };
 use std::collections::{ HashMap, VecDeque, hash_map::Entry };
+use rand::Rng;
 use bytes::{ Bytes, BytesMut, BufMut };
 use smallvec::SmallVec;
 use crossbeam_queue::{ ArrayQueue, PushError };
 use futures::{ try_ready, Future, Stream, Sink, Poll, Async, StartSend, AsyncSink };
 use tokio_timer::Delay;
+use tokio_udp::UdpSocket;
 use tokio_sync::{ mpsc, oneshot };
-use common::{ LossyIo, to_io_error };
+use common::{ to_io_error };
 
 
 pub struct QuicConnector {
     config: Arc<Mutex<quiche::Config>>
 }
 
-pub struct Connecting<IO> {
+pub struct Connecting {
     is_server: bool,
-    inner: MidHandshake<IO>
+    inner: MidHandshake
 }
 
-enum MidHandshake<IO> {
-    Handshaking(Inner<IO>),
+enum MidHandshake {
+    Handshaking(Inner),
     End
 }
 
@@ -50,9 +52,9 @@ impl Drop for Anchor {
     }
 }
 
-pub struct Driver<IO> {
+pub struct Driver {
     is_server: bool,
-    inner: Inner<IO>,
+    inner: Inner,
     max_id: u64,
     close_recv: oneshot::Receiver<()>,
     close_queue: Vec<u64>,
@@ -86,107 +88,131 @@ enum Message {
     Close,
 }
 
-struct Inner<IO> {
-    io: IO,
+struct Inner {
+    io: UdpSocket,
+    scid: Vec<u8>,
     connect: Box<quiche::Connection>,
-    timer: Option<Delay>,
+    timer: Delay,
     send_buf: Vec<u8>,
     send_pos: usize,
     send_end: usize,
     send_flush: bool,
-    recv_buf: Vec<u8>
+    recv_buf: Vec<u8>,
 }
 
-impl<IO: LossyIo> Inner<IO> {
-    fn poll_complete(&mut self) -> Poll<(), io::Error> {
-        if let Some(timer) = &mut self.timer {
-            if let Ok(Async::Ready(())) = timer.poll() {
-                self.connect.on_timeout();
-            }
+impl From<quiche::Config> for QuicConnector {
+    fn from(config: quiche::Config) -> QuicConnector {
+        QuicConnector { config: Arc::new(Mutex::new(config)) }
+    }
+}
+
+impl QuicConnector {
+    pub fn connect(&self, server_name: &str, io: UdpSocket) -> io::Result<Connecting> {
+        let mut scid = vec![0; 16];
+        rand::thread_rng().fill(&mut *scid);
+        quiche::connect(Some(server_name), &scid, &mut self.config.lock().unwrap())
+            .map(move |connect| Connecting {
+                is_server: false,
+                inner: MidHandshake::Handshaking(Inner {
+                    io, scid, connect,
+                    timer: Delay::new(Instant::now()),
+                    send_buf: vec![0; 1350],
+                    send_pos: 0,
+                    send_end: 0,
+                    send_flush: false,
+                    recv_buf: vec![0; 65535]
+                })
+            })
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    }
+}
+
+impl Inner {
+    fn poll_io_complete(&mut self) -> Poll<(), io::Error> {
+        if let Ok(Async::Ready(())) = self.timer.poll() {
+            self.connect.on_timeout();
         }
 
-        match self.connect.timeout() {
-            Some(timeout) => if let Some(timer) = &mut self.timer {
-                timer.reset(Instant::now() + timeout);
-            } else {
-                self.timer = Some(Delay::new(Instant::now() + timeout));
-            },
-            None => self.timer = None
+        if let Some(timeout) = self.connect.timeout() {
+            self.timer.reset(Instant::now() + timeout);
+        } else {
+            self.timer.reset(Instant::now());
         }
 
-        self.poll_recv()?;
-        self.poll_send()?;
+        let recv_result = self.poll_recv()?;
+        let send_result = self.poll_send()?;
 
-        Ok(Async::NotReady)
+        if recv_result.is_not_ready() && send_result.is_not_ready() {
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(()))
+        }
     }
 
     fn poll_send(&mut self) -> Poll<(), io::Error> {
-        loop {
-            if self.send_flush {
-                while self.send_pos != self.send_end {
-                    let n = try_ready!(self.io.poll_write(&mut self.send_buf[self.send_pos..]));
-                    self.send_pos += n;
-                }
-
-                self.send_pos = 0;
-                self.send_end = 0;
-                self.send_flush = false;
+        if self.send_flush {
+            while self.send_pos != self.send_end {
+                let n = try_ready!(self.io.poll_send(&mut self.send_buf[self.send_pos..]));
+                self.send_pos += n;
             }
 
-            match self.connect.send(&mut self.send_buf[self.send_end..]) {
-                Ok(n) => {
-                    self.send_end += n;
-                    self.send_flush = self.send_end == self.send_buf.len() - 1;
-                },
-                Err(quiche::Error::Done) => return Ok(Async::Ready(())),
-                Err(quiche::Error::BufferTooShort) => {
-                    self.send_flush = true;
-                    continue;
-                },
-                Err(err) => {
-                    self.connect.close(false, err.to_wire(), b"fail")
-                        .map_err(to_io_error)?;
-                    return Ok(Async::NotReady);
-                }
-            }
-
-            let n = try_ready!(self.io.poll_write(&mut self.send_buf[self.send_pos..self.send_end]));
-            self.send_pos += n;
+            self.send_pos = 0;
+            self.send_end = 0;
+            self.send_flush = false;
         }
+
+        match self.connect.send(&mut self.send_buf[self.send_end..]) {
+            Ok(n) => {
+                self.send_end += n;
+                self.send_flush = self.send_end == self.send_buf.len() - 1;
+            },
+            Err(quiche::Error::Done) if self.send_pos != self.send_end => (),
+            Err(quiche::Error::Done) => return Ok(Async::NotReady),
+            Err(quiche::Error::BufferTooShort) => {
+                self.send_flush = true;
+                return Ok(Async::Ready(()));
+            },
+            Err(err) => {
+                self.connect.close(false, err.to_wire(), b"fail")
+                    .map_err(to_io_error)?;
+                return Ok(Async::NotReady);
+            }
+        }
+
+        let n = try_ready!(self.io.poll_send(&mut self.send_buf[self.send_pos..self.send_end]));
+        self.send_pos += n;
+
+        Ok(Async::Ready(()))
     }
 
     fn poll_recv(&mut self) -> Poll<(), io::Error> {
-        loop {
-            let n = try_ready!(self.io.poll_read(&mut self.recv_buf));
+        let n = try_ready!(self.io.poll_recv(&mut self.recv_buf));
 
-            match self.connect.recv(&mut self.recv_buf[..n]) {
-                Ok(_) => (),
-                Err(quiche::Error::Done) => return Ok(Async::Ready(())),
-                Err(quiche::Error::BufferTooShort) => return Ok(Async::NotReady),
-                Err(err) => {
-                    self.connect.close(false, err.to_wire(), b"fail")
-                        .map_err(to_io_error)?;
-                    return Ok(Async::NotReady);
-                }
+        match self.connect.recv(&mut self.recv_buf[..n]) {
+            Ok(_) => Ok(Async::Ready(())),
+            Err(quiche::Error::Done) => Ok(Async::Ready(())),
+            Err(quiche::Error::BufferTooShort) => Ok(Async::Ready(())),
+            Err(err) => {
+                self.connect.close(false, err.to_wire(), b"fail")
+                    .map_err(to_io_error)?;
+                Ok(Async::NotReady)
             }
         }
     }
 }
 
-impl<IO: LossyIo> Future for Connecting<IO> {
-    type Item = (Driver<IO>, Connection, Incoming);
+impl Future for Connecting {
+    type Item = (Driver, Connection, Incoming);
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let MidHandshake::Handshaking(inner) = &mut self.inner {
-            try_ready!(inner.poll_send());
-
             while !inner.connect.is_established() {
                 if inner.connect.is_closed() {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
 
-                try_ready!(inner.poll_complete());
+                try_ready!(inner.poll_io_complete());
             }
         }
 
@@ -227,14 +253,12 @@ impl<IO: LossyIo> Future for Connecting<IO> {
     }
 }
 
-impl<IO: LossyIo> Future for Driver<IO> {
+impl Future for Driver {
     type Item = ();
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
-            self.inner.poll_complete()?;
-
             while let Ok(Async::Ready(Some((id, msg)))) = self.event_recv.poll() {
                 let result = match msg {
                     Message::Bytes(bytes) => self.inner.connect.stream_send(id, &bytes, false),
@@ -311,6 +335,8 @@ impl<IO: LossyIo> Future for Driver<IO> {
             while let Some(id) = self.close_queue.pop() {
                 self.stream_map.remove(&id);
             }
+
+            try_ready!(self.inner.poll_io_complete());
         }
     }
 }
@@ -345,12 +371,12 @@ impl Connection {
 
 impl Future for Opening {
     type Item = QuicStream;
-    type Error = ();
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let anchor = match self.anchor.take() {
             Some(anchor) => anchor,
-            None => return Err(())
+            None => return Err(io::ErrorKind::ConnectionAborted.into())
         };
 
         match self.rx.poll() {
@@ -359,7 +385,7 @@ impl Future for Opening {
                 self.anchor = Some(anchor);
                 Ok(Async::NotReady)
             },
-            Err(_) => Err(())
+            Err(_) => Err(io::ErrorKind::ConnectionAborted.into())
         }
     }
 }

@@ -17,3 +17,6 @@ tokio-executor = "*"
 tokio-sync = "*"
 tokio-udp = "*"
 quiche = { path = "../fork/quiche", default-features = false }
+
+[dev-dependencies]
+tokio = "*"
