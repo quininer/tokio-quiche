@@ -56,7 +56,7 @@ pub struct Driver {
     is_server: bool,
     inner: Inner,
     max_id: u64,
-    close_recv: oneshot::Receiver<()>,
+    close_recv: Option<oneshot::Receiver<()>>,
     close_queue: Vec<u64>,
     incoming_send: mpsc::UnboundedSender<InnerStream>,
     event_send: mpsc::Sender<(u64, Message)>,
@@ -82,6 +82,7 @@ struct InnerStream {
     rx: mpsc::UnboundedReceiver<quiche::Result<Message>>
 }
 
+#[derive(Debug)]
 enum Message {
     Bytes(Bytes),
     End(Bytes),
@@ -92,7 +93,7 @@ struct Inner {
     io: UdpSocket,
     scid: Vec<u8>,
     connect: Box<quiche::Connection>,
-    timer: Delay,
+    timer: Option<Delay>,
     send_buf: Vec<u8>,
     send_pos: usize,
     send_end: usize,
@@ -115,7 +116,7 @@ impl QuicConnector {
                 is_server: false,
                 inner: MidHandshake::Handshaking(Inner {
                     io, scid, connect,
-                    timer: Delay::new(Instant::now()),
+                    timer: None,
                     send_buf: vec![0; 1350],
                     send_pos: 0,
                     send_end: 0,
@@ -128,24 +129,32 @@ impl QuicConnector {
 }
 
 impl Inner {
-    fn poll_io_complete(&mut self) -> Poll<(), io::Error> {
-        if let Ok(Async::Ready(())) = self.timer.poll() {
-            self.connect.on_timeout();
+    fn poll_io_complete(&mut self) -> Poll<Option<()>, io::Error> {
+        if let Some(timer) = self.timer.as_mut() {
+            if let Ok(Async::Ready(())) = timer.poll() {
+                self.connect.on_timeout();
+            }
         }
 
         if let Some(timeout) = self.connect.timeout() {
-            self.timer.reset(Instant::now() + timeout);
+            if let Some(timer) = self.timer.as_mut() {
+                timer.reset(Instant::now() + timeout);
+            } else {
+                self.timer = Some(Delay::new(Instant::now() + timeout));
+            }
+
+            let _ = self.timer.poll();
         } else {
-            self.timer.reset(Instant::now());
+            self.timer = None;
         }
 
         let recv_result = self.poll_recv()?;
         let send_result = self.poll_send()?;
 
-        if recv_result.is_not_ready() && send_result.is_not_ready() {
-            Ok(Async::NotReady)
-        } else {
-            Ok(Async::Ready(()))
+        match (self.connect.is_closed(), recv_result, send_result) {
+            (true, ..) => Ok(Async::Ready(None)),
+            (false, Async::NotReady, Async::NotReady) => Ok(Async::NotReady),
+            (..) => Ok(Async::Ready(Some(())))
         }
     }
 
@@ -191,7 +200,7 @@ impl Inner {
         match self.connect.recv(&mut self.recv_buf[..n]) {
             Ok(_) => Ok(Async::Ready(())),
             Err(quiche::Error::Done) => Ok(Async::Ready(())),
-            Err(quiche::Error::BufferTooShort) => Ok(Async::Ready(())),
+//            Err(quiche::Error::BufferTooShort) => Ok(Async::Ready(())),
             Err(err) => {
                 self.connect.close(false, err.to_wire(), b"fail")
                     .map_err(to_io_error)?;
@@ -236,9 +245,10 @@ impl Future for Connecting {
 
                 let driver = Driver {
                     is_server: self.is_server,
-                    inner, close_recv, incoming_send,
+                    inner, incoming_send,
                     event_send, event_recv, open_recv,
                     max_id: 0,
+                    close_recv: Some(close_recv),
                     close_queue: Vec::new(),
                     stream_map: HashMap::new(),
                     send_buf: BytesMut::new(),
@@ -324,19 +334,21 @@ impl Future for Driver {
                 }
             }
 
-            if let Ok(Async::Ready(())) = self.close_recv.poll() {
-                self.inner.connect.close(true, 0x0, b"closing").map_err(to_io_error)?;
-            }
-
-            if self.inner.connect.is_closed() {
-                return Ok(Async::Ready(()))
+            if let Some(mut close_recv) = self.close_recv.take() {
+                if let Ok(Async::Ready(())) = close_recv.poll() {
+                    self.inner.connect.close(true, 0x0, b"closing").map_err(to_io_error)?;
+                } else {
+                    self.close_recv = Some(close_recv);
+                }
             }
 
             while let Some(id) = self.close_queue.pop() {
                 self.stream_map.remove(&id);
             }
 
-            try_ready!(self.inner.poll_io_complete());
+            if try_ready!(self.inner.poll_io_complete()).is_none() {
+                return Ok(Async::Ready(()));
+            }
         }
     }
 }
