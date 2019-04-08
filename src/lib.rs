@@ -63,7 +63,7 @@ pub struct Driver {
     event_recv: mpsc::Receiver<(u64, Message)>,
     open_recv: mpsc::UnboundedReceiver<oneshot::Sender<InnerStream>>,
     stream_map: HashMap<u64, mpsc::UnboundedSender<quiche::Result<Message>>>,
-    send_buf: BytesMut
+    send_buf: Vec<u8>
 }
 
 pub struct Opening {
@@ -84,8 +84,8 @@ struct InnerStream {
 
 #[derive(Debug)]
 enum Message {
-    Bytes(Bytes),
-    End(Bytes),
+    Bytes(Vec<u8>),
+    End(Vec<u8>),
     Close,
 }
 
@@ -251,7 +251,7 @@ impl Future for Connecting {
                     close_recv: Some(close_recv),
                     close_queue: Vec::new(),
                     stream_map: HashMap::new(),
-                    send_buf: BytesMut::new(),
+                    send_buf: vec![0; 8 * 1024],
                 };
 
                 // TODO
@@ -305,16 +305,12 @@ impl Future for Driver {
                         tx
                     });
 
-                self.send_buf.reserve(8 * 1024); // TODO
-
-                match self.inner.connect.stream_recv(id, unsafe { self.send_buf.bytes_mut() }) {
+                match self.inner.connect.stream_recv(id, &mut self.send_buf) {
                     Ok((n, fin)) => {
-                        unsafe { self.send_buf.advance_mut(n) };
-
                         let _ = tx.try_send(Ok(if fin {
-                            Message::End(self.send_buf.take().freeze())
+                            Message::End(self.send_buf[..n].to_vec())
                         } else {
-                            Message::Bytes(self.send_buf.take().freeze())
+                            Message::Bytes(self.send_buf[..n].to_vec())
                         }));
                     },
                     Err(err) => {
@@ -403,7 +399,7 @@ impl Future for Opening {
 }
 
 impl Sink for QuicStream {
-    type SinkItem = Bytes;
+    type SinkItem = Vec<u8>;
     type SinkError = io::Error;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
@@ -429,7 +425,7 @@ impl Sink for QuicStream {
 }
 
 impl Stream for QuicStream {
-    type Item = Bytes;
+    type Item = Vec<u8>;
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {

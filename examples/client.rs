@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<std::error::Error + Send + Sync + 'static>> {
             current_thread::spawn(driver.map_err(|err| eprintln!("{:?}", err)));
 
             let fut = connection.open()
-                .and_then(|stream| stream.send(Bytes::from_static(b"GET / HTTP/0.9\r\nHost: localhost\r\nUser-Agent: quiche\r\n\r\n")))
+                .and_then(|stream| stream.send(b"GET / HTTP/0.9\r\nHost: localhost\r\nUser-Agent: quiche\r\n\r\n".to_vec()))
                 .and_then(|stream| stream.into_future().map_err(|(err, _)| err))
                 .and_then(|(msg, mut stream)| {
                     if let Some(msg) = msg {
