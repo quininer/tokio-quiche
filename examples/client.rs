@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use bytes::Bytes;
 use tokio::prelude::*;
 use tokio::net::UdpSocket;
 use tokio::runtime::current_thread;
@@ -32,22 +31,13 @@ fn main() -> Result<(), Box<std::error::Error + Send + Sync + 'static>> {
             current_thread::spawn(driver.map_err(|err| eprintln!("{:?}", err)));
 
             let fut = connection.open()
-                .and_then(|stream| stream.send(b"GET / HTTP/0.9\r\nHost: localhost\r\nUser-Agent: quiche\r\n\r\n".to_vec()))
-                .and_then(|stream| stream.into_future().map_err(|(err, _)| err))
-                .and_then(|(msg, mut stream)| {
-                    if let Some(msg) = msg {
-                        println!("{}", String::from_utf8_lossy(&msg));
-                    } else {
-                        println!("None");
-                    }
-
-                    future::poll_fn(move || stream.close())
-                })
-                .map(drop);
+                .and_then(|stream| stream.send(b"GET /Cargo.toml".to_vec()))
+                .and_then(|stream| stream.concat2())
+                .map(|msg| println!("{}", String::from_utf8_lossy(&msg)));
 
             fut
         })
-        .map_err(|err| panic!(err));
+        .map_err(|err| panic!("{:?}", err));
 
     current_thread::run(fut);
     Ok(())

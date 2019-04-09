@@ -7,15 +7,13 @@ edition = "2018"
 [dependencies]
 log = "*"
 rand = "*"
-bytes = "*"
 smallvec = "*"
-crossbeam-queue = "*"
 futures = "*"
 tokio-io = "*"
 tokio-timer = "*"
-tokio-executor = "*"
 tokio-sync = "*"
 tokio-udp = "*"
+# quiche = { git = "https://github.com/cloudflare/quiche" }
 quiche = { path = "../fork/quiche", default-features = false }
 
 [dev-dependencies]

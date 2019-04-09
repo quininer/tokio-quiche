@@ -1,19 +1,17 @@
-mod common;
-
-use std::{ io, mem, cmp };
+use std::{ io, mem };
 use std::time::Instant;
 use std::sync::{ Arc, Mutex };
-use std::collections::{ HashMap, VecDeque, hash_map::Entry };
+use std::collections::HashMap;
 use rand::Rng;
-use bytes::{ Bytes, BytesMut, BufMut };
 use smallvec::SmallVec;
-use crossbeam_queue::{ ArrayQueue, PushError };
 use futures::{ try_ready, Future, Stream, Sink, Poll, Async, StartSend, AsyncSink };
 use tokio_timer::Delay;
 use tokio_udp::UdpSocket;
 use tokio_sync::{ mpsc, oneshot };
-use common::{ to_io_error };
 
+
+const MAX_DATAGRAM_SIZE: usize = 1350;
+const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 pub struct QuicConnector {
     config: Arc<Mutex<quiche::Config>>
@@ -32,9 +30,6 @@ enum MidHandshake {
 pub struct Connection {
     anchor: Arc<Anchor>,
     open_send: mpsc::UnboundedSender<oneshot::Sender<InnerStream>>,
-    trace_id: String,
-    alpn: Vec<u8>,
-    is_resumed: bool
 }
 
 pub struct Incoming {
@@ -59,11 +54,11 @@ pub struct Driver {
     close_recv: Option<oneshot::Receiver<()>>,
     close_queue: Vec<u64>,
     incoming_send: mpsc::UnboundedSender<InnerStream>,
-    event_send: mpsc::Sender<(u64, Message)>,
-    event_recv: mpsc::Receiver<(u64, Message)>,
+    event_send: mpsc::UnboundedSender<(u64, Message)>,
+    event_recv: mpsc::UnboundedReceiver<(u64, Message)>,
     open_recv: mpsc::UnboundedReceiver<oneshot::Sender<InnerStream>>,
     stream_map: HashMap<u64, mpsc::UnboundedSender<quiche::Result<Message>>>,
-    send_buf: Vec<u8>
+    stream_buf: Vec<u8>
 }
 
 pub struct Opening {
@@ -72,13 +67,13 @@ pub struct Opening {
 }
 
 pub struct QuicStream {
-    anchor: Arc<Anchor>,
+    _anchor: Arc<Anchor>,
     inner: InnerStream,
 }
 
 struct InnerStream {
     id: u64,
-    event_send: mpsc::Sender<(u64, Message)>,
+    event_send: mpsc::UnboundedSender<(u64, Message)>,
     rx: mpsc::UnboundedReceiver<quiche::Result<Message>>
 }
 
@@ -91,7 +86,7 @@ enum Message {
 
 struct Inner {
     io: UdpSocket,
-    scid: Vec<u8>,
+    #[allow(dead_code)] scid: Vec<u8>,
     connect: Box<quiche::Connection>,
     timer: Option<Delay>,
     send_buf: Vec<u8>,
@@ -117,11 +112,30 @@ impl QuicConnector {
                 inner: MidHandshake::Handshaking(Inner {
                     io, scid, connect,
                     timer: None,
-                    send_buf: vec![0; 1350],
+                    send_buf: vec![0; MAX_DATAGRAM_SIZE],
                     send_pos: 0,
                     send_end: 0,
                     send_flush: false,
-                    recv_buf: vec![0; 65535]
+                    recv_buf: vec![0; STREAM_BUFFER_SIZE]
+                })
+            })
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    }
+
+    pub fn accept(&self, io: UdpSocket) -> io::Result<Connecting> {
+        let mut scid = vec![0; 16];
+        rand::thread_rng().fill(&mut *scid);
+        quiche::accept(&scid, None, &mut self.config.lock().unwrap())
+            .map(move |connect| Connecting {
+                is_server: false,
+                inner: MidHandshake::Handshaking(Inner {
+                    io, scid, connect,
+                    timer: None,
+                    send_buf: vec![0; MAX_DATAGRAM_SIZE],
+                    send_pos: 0,
+                    send_end: 0,
+                    send_flush: false,
+                    recv_buf: vec![0; STREAM_BUFFER_SIZE]
                 })
             })
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
@@ -200,7 +214,6 @@ impl Inner {
         match self.connect.recv(&mut self.recv_buf[..n]) {
             Ok(_) => Ok(Async::Ready(())),
             Err(quiche::Error::Done) => Ok(Async::Ready(())),
-//            Err(quiche::Error::BufferTooShort) => Ok(Async::Ready(())),
             Err(err) => {
                 self.connect.close(false, err.to_wire(), b"fail")
                     .map_err(to_io_error)?;
@@ -217,11 +230,9 @@ impl Future for Connecting {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let MidHandshake::Handshaking(inner) = &mut self.inner {
             while !inner.connect.is_established() {
-                if inner.connect.is_closed() {
+                if try_ready!(inner.poll_io_complete()).is_none() && !inner.connect.is_established() {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-
-                try_ready!(inner.poll_io_complete());
             }
         }
 
@@ -230,14 +241,11 @@ impl Future for Connecting {
                 let (anchor, close_recv) = oneshot::channel();
                 let anchor = Arc::new(Anchor(Some(anchor)));
                 let (incoming_send, incoming_recv) = mpsc::unbounded_channel();
-                let (event_send, event_recv) = mpsc::channel(32); // TODO
+                let (event_send, event_recv) = mpsc::unbounded_channel();
                 let (open_send, open_recv) = mpsc::unbounded_channel();
 
                 let connection = Connection {
                     anchor: Arc::clone(&anchor),
-                    trace_id: inner.connect.trace_id().to_string(),
-                    alpn: inner.connect.application_proto().to_vec(),
-                    is_resumed: inner.connect.is_resumed(),
                     open_send
                 };
 
@@ -251,10 +259,8 @@ impl Future for Connecting {
                     close_recv: Some(close_recv),
                     close_queue: Vec::new(),
                     stream_map: HashMap::new(),
-                    send_buf: vec![0; 8 * 1024],
+                    stream_buf: vec![0; STREAM_BUFFER_SIZE],
                 };
-
-                // TODO
 
                 Ok(Async::Ready((driver, connection, incoming)))
             },
@@ -289,7 +295,7 @@ impl Future for Driver {
 
             let readable = self.inner.connect
                 .readable()
-                .collect::<SmallVec<[_; 4]>>();
+                .collect::<SmallVec<[_; 2]>>();
             for id in readable {
                 if self.inner.connect.stream_finished(id) {
                     continue
@@ -305,12 +311,12 @@ impl Future for Driver {
                         tx
                     });
 
-                match self.inner.connect.stream_recv(id, &mut self.send_buf) {
+                match self.inner.connect.stream_recv(id, &mut self.stream_buf) {
                     Ok((n, fin)) => {
                         let _ = tx.try_send(Ok(if fin {
-                            Message::End(self.send_buf[..n].to_vec())
+                            Message::End(self.stream_buf[..n].to_vec())
                         } else {
-                            Message::Bytes(self.send_buf[..n].to_vec())
+                            Message::Bytes(self.stream_buf[..n].to_vec())
                         }));
                     },
                     Err(err) => {
@@ -357,7 +363,7 @@ impl Stream for Incoming {
         match self.rx.poll() {
             Ok(Async::Ready(Some(inner))) => Ok(Async::Ready(Some(QuicStream {
                 inner,
-                anchor: self.anchor.clone()
+                _anchor: self.anchor.clone()
             }))),
             Ok(Async::NotReady) => Ok(Async::NotReady),
             _ => Ok(Async::Ready(None))
@@ -388,7 +394,7 @@ impl Future for Opening {
         };
 
         match self.rx.poll() {
-            Ok(Async::Ready(inner)) => Ok(Async::Ready(QuicStream { anchor, inner })),
+            Ok(Async::Ready(inner)) => Ok(Async::Ready(QuicStream { _anchor: anchor, inner })),
             Ok(Async::NotReady) => {
                 self.anchor = Some(anchor);
                 Ok(Async::NotReady)
@@ -405,7 +411,7 @@ impl Sink for QuicStream {
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         match self.inner.event_send.start_send((self.inner.id, Message::Bytes(item))) {
             Ok(AsyncSink::Ready) => Ok(AsyncSink::Ready),
-            Ok(AsyncSink::NotReady((_, Message::Bytes(item)))) => Ok(AsyncSink::NotReady(item)),
+            Ok(AsyncSink::NotReady((_, Message::Bytes(item)))) => Ok(AsyncSink::NotReady(item)), // TODO unreachable
             Ok(_) => unreachable!(),
             Err(err) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, err))
         }
@@ -430,15 +436,23 @@ impl Stream for QuicStream {
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         match self.inner.rx.poll() {
-            Ok(Async::Ready(Some(Ok(Message::Bytes(item)))))
-            | Ok(Async::Ready(Some(Ok(Message::End(item)))))
-            => Ok(Async::Ready(Some(item))),
+            Ok(Async::Ready(Some(Ok(Message::Bytes(item))))) => Ok(Async::Ready(Some(item))),
+            Ok(Async::Ready(Some(Ok(Message::End(item))))) => {
+                self.inner.rx.close();
+                Ok(Async::Ready(Some(item)))
+            },
             Ok(Async::Ready(Some(Err(err)))) => Err(to_io_error(err)),
-            Ok(Async::Ready(Some(Ok(Message::Close))))
-            | Ok(Async::Ready(None))
-            => Ok(Async::Ready(None)),
+            Ok(Async::Ready(Some(Ok(Message::Close)))) => {
+                self.inner.rx.close();
+                Ok(Async::Ready(None))
+            },
+            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
             Ok(Async::NotReady) => Ok(Async::NotReady),
             Err(err) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, err))
         }
     }
+}
+
+fn to_io_error(err: quiche::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err)
 }
